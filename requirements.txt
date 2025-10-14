@@ -1,0 +1,7 @@
+opencv-python
+facenet-pytorch
+deepface
+torch
+torchvision
+numpy
+pickle-mixin
