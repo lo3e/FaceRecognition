@@ -1,138 +1,222 @@
+# ==========================================
+# 🎥 FACE RECOGNITION LIVE (ASYNCHRONOUS)
+# ==========================================
+
 import os
 import cv2
 import pickle
-import torch
 import time
 import threading
 import msvcrt
-from facenet_pytorch import MTCNN, InceptionResnetV1
-from deepface import DeepFace
+import queue
+
+# === UTILS ===
+
 from utils.facenet_utils import compare_embeddings
 from utils.speech_utils import speak, transcribe_audio
 from utils.dialog_manager import ask_ollama
+from utils.async_core import (
+    detect_request_q, detect_result_q,
+    embed_request_q, embed_result_q,
+    tts_q, start_workers, exit_event,
+    speak_async, shutdown_tts_executor,
+    worker_ready_event
+)
 
-# ==============================
-# ⚙️ EXIT FLAG
-# ==============================
+# ==========================================
+# ⚙️ CONFIGURAZIONE
+# ==========================================
 
-exit_flag = False
+EMB_FILE = "../data/embeddings.pkl"
+
+# ==========================================
+# ⌨️ ASCOLTO TASTO 'Q'
+# ==========================================
 
 def key_listener():
-    global exit_flag
-    while True:
+    """Thread per intercettare il tasto Q in qualsiasi momento."""
+    while not exit_event.is_set():
         if msvcrt.kbhit():
             key = msvcrt.getch()
             if key in [b'q', b'Q']:
-                exit_flag = True
+                print("\n👋 Chiusura richiesta (tasto Q)...")
+                exit_event.set()
                 break
 
-# ==============================
-# 🔊 THREAD PER INTERAZIONE
-# ==============================
+# ==========================================
+# 🔊 INTERAZIONE (TTS + STT + LLM)
+# ==========================================
 
-def handle_interaction(name):
-    """Thread separato per parlare, ascoltare e rispondere."""
+def handle_interaction(name: str):
     try:
-        greeting = f"Ciao {name}!" if name != "Volto rilevato" else "Ciao, piacere di conoscerti! Come stai?"
-        speak(greeting)
-        user_text = transcribe_audio(duration=5)
-        if user_text.strip():
-            reply = ask_ollama(user_text)
-            speak(reply)
+        greeting = f"Ciao {name}!" if name != "Volto rilevato" else "Ciao, piacere di conoscerti!"
+
+        # 🔹 1. parla (blocca solo questo thread)
+        future = speak_async(speak, greeting)
+        future.result()  # aspetta che finisca il saluto
+
+        # 🔹 2. breve pausa per evitare di catturare l'audio del TTS
+        time.sleep(0.6)
+
+        # 🔹 3. ascolta ora
+        user_text = transcribe_audio(duration=3, stop_on_silence=True).strip()
+        if not user_text:
+            return
+
+        # 🔹 4. elabora con Ollama in background
+        reply_future = ask_ollama(user_text)
+        reply = reply_future.result(timeout=10)
+
+        # 🔹 5. parla la risposta (non blocca)
+        speak_async(speak, reply)
+
     except Exception as e:
-        print(f"⚠️ Errore nel thread vocale: {e}")
+        print(f"[INTERACT] Errore: {e}")
 
-# ==============================
-# ⚙️ CONFIGURAZIONE
-# ==============================
+# ==========================================
+# 📦 DATABASE VOLTI
+# ==========================================
 
-EMB_FILE = "../data/embeddings.pkl"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🧠 Utilizzo dispositivo: {DEVICE}")
+def load_known_faces():
+    """Carica il database di embedding noti."""
+    if os.path.exists(EMB_FILE):
+        with open(EMB_FILE, "rb") as f:
+            known = pickle.load(f)
+        print(f"✅ Caricati {len(known)} volti noti.")
+        return known
+    else:
+        print("⚠️ Nessun volto registrato. Avvio in modalità rilevazione.")
+        return {}
 
-# ==============================
-# 📦 CARICAMENTO DATABASE
-# ==============================
+# ==========================================
+# 🧠 MAIN LOOP
+# ==========================================
 
-if os.path.exists(EMB_FILE):
-    with open(EMB_FILE, "rb") as f:
-        known_faces = pickle.load(f)
-    print(f"✅ Caricati {len(known_faces)} volti noti.")
-else:
-    known_faces = {}
-    print("⚠️ Nessun volto registrato. Avvio in modalità sola rilevazione...")
+def main():
+    # === AVVIO WORKER E TRACKER ===
+    # Avvia worker asincroni
+    start_workers(speak_func=speak)
 
-# ==============================
-# 🔍 INIZIALIZZA FACENET E MTCNN
-# ==============================
+    print("🔊 Warm-up TTS...")
+    speak(" ")  # una parola vuota, inizializza engine
+    print("✅ TTS pronto.")
 
-mtcnn = MTCNN(keep_all=True, device=DEVICE)
-resnet = InceptionResnetV1(pretrained="vggface2").eval().to(DEVICE)
+    print("🕐 Attendo che il detection worker completi il warm-up...")
+    worker_ready_event.wait()
+    print("✅ Detection worker pronto. Avvio webcam.")
 
-# ==============================
-# 🎥 AVVIO CAMERA
-# ==============================
+    # Carica database
+    known_faces = load_known_faces()
 
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("❌ Errore: impossibile aprire la webcam.")
-    exit()
+    # Avvia webcam
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Errore: impossibile aprire la webcam.")
+        return
 
-print("\n🎬 Avvio riconoscimento live...")
-print("Premi 'q' per uscire.\n")
+    print("\n🎬 Avvio riconoscimento live...")
+    print("Premi 'q' per uscire.\n")
 
-seen_names = set()
-last_age_gender = {}
-last_analysis_time = 0
-frame_count = 0
+    seen_names = set()
+    trackers = {}            # id → tracker
+    track_lost = {}          # id → contatore frame persi
+    next_face_id = 0
+    TRACKER_MAX_LOST = 8
+    frame_id = 0
 
-# ==============================
-# 🎧 THREAD ASCOLTO TASTO 'Q'
-# threading.Thread(target=key_listener, daemon=True).start()
+    # Avvia thread per ascolto tasto 'q'
+    threading.Thread(target=key_listener, daemon=True).start()
 
-# ==============================
-# 🔁 LOOP PRINCIPALE
-# ==============================
+    print("\n🎬 Sistema pronto. Avvio stream video...\n")
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("❌ Frame non letto correttamente dalla webcam.")
-        break
-
-    # Riduci risoluzione per performance migliori
-    frame = cv2.resize(frame, (640, 480))
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    # Elabora 1 frame ogni 3 per alleggerire CPU
-    frame_count += 1
-    if frame_count % 3 != 0:
-        cv2.imshow("Face Recognition Live", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+    while not exit_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            print("❌ Frame non letto correttamente.")
             break
-        continue
 
-    boxes, _ = mtcnn.detect(rgb)
+        frame = cv2.resize(frame, (640, 480))
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_id += 1
 
-    if boxes is not None:
-        for i, box in enumerate(boxes):
+        # --- 🔹 Invia frame al detection worker (max 1 alla volta)
+        if detect_request_q.qsize() < 1:
             try:
-                x1, y1, x2, y2 = [int(b) for b in box]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+                detect_request_q.put_nowait((frame_id, rgb.copy()))
+            except queue.Full:
+                pass
 
-                # ====== FACE EMBEDDING (GPU) ======
-                face = rgb[y1:y2, x1:x2]
-                face_tensor = torch.tensor(face).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-                face_tensor = torch.nn.functional.interpolate(face_tensor, size=(160, 160))
-                face_tensor = face_tensor.to(DEVICE)
+        # --- 🔹 Recupera eventuali risultati del detection worker
+        boxes = None
+        try:
+            while not detect_result_q.empty():
+                fid, result = detect_result_q.get_nowait()
+                detect_result_q.task_done()
+                boxes = result
+                #if boxes is not None and len(boxes) > 0:
+                #    print(f"[MAIN] Ricevute {len(boxes)} box dal detection worker")
+                #else:
+                #    print("[MAIN] Nessuna box ricevuta dal detection worker")
+        except queue.Empty:
+            pass
 
-                with torch.no_grad():
-                    embedding = resnet(face_tensor).cpu().numpy()
+        # --- 🔹 Se nessuna detection, aggiorna tracker esistenti
+        if boxes is None and trackers:
+            boxes = []
+            for fid, tr in list(trackers.items()):
+                ok, box = tr.update(frame)
+                if ok:
+                    x, y, w, h = map(int, box)
+                    boxes.append([x, y, x + w, y + h])
+                    track_lost[fid] = 0
+                else:
+                    track_lost[fid] += 1
+                    if track_lost[fid] > TRACKER_MAX_LOST:
+                        del trackers[fid]
+                        del track_lost[fid]
+
+        # --- 🔹 Se abbiamo nuove detection → reset tracker
+        if boxes is not None:
+            boxes = [b for b in boxes if b is not None]
+            trackers.clear()
+            track_lost.clear()
+            for b in boxes:
+                x1, y1, x2, y2 = map(int, b)
+                w, h = x2 - x1, y2 - y1
+                tracker = (
+                    cv2.legacy.TrackerCSRT_create()
+                    if hasattr(cv2.legacy, "TrackerCSRT_create")
+                    else cv2.TrackerCSRT_create()
+                )
+                trackers[f"t{next_face_id}"] = tracker
+                tracker.init(frame, (x1, y1, w, h))
+                track_lost[f"t{next_face_id}"] = 0
+                next_face_id += 1
+
+        # --- 🔹 Disegna box e invia embedding request
+        if boxes is not None:
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = map(int, box)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                face_id = f"face_{i}"
+                if not embed_request_q.full():
+                    try:
+                        embed_request_q.put_nowait((face_id, rgb.copy(), box))
+                        #print(f"[EMBED-REQ] Enqueued embedding for {face_id}")
+                    except queue.Full:
+                        pass
+
+        # --- 🔹 Legge eventuali embedding pronti
+        try:
+            while not embed_result_q.empty():
+                print("[MAIN] Checking embedding results…")
+                fid, embedding = embed_result_q.get_nowait()
+                print(f"[MAIN] Got embedding for {fid}")
+                embed_result_q.task_done()
 
                 name = "Volto rilevato"
 
-                # ====== CONFRONTO CON DATABASE ======
+                # 🔍 Confronto con database volti noti
                 if known_faces:
                     for person, emb_db in known_faces.items():
                         match, dist = compare_embeddings(embedding, emb_db)
@@ -140,46 +224,33 @@ while True:
                             name = person
                             break
 
-                # ====== NUOVO VOLTO → THREAD INTERAZIONE ======
+                # 🔊 Se volto nuovo, avvia interazione vocale
                 if name not in seen_names:
                     seen_names.add(name)
+                    print(f"👁️  Nuovo volto rilevato: {name}")
                     threading.Thread(target=handle_interaction, args=(name,), daemon=True).start()
 
-                # ====== ANALISI ETÀ/GENERE OGNI 2s ======
-                now = time.time()
-                if (now - last_analysis_time > 2) or (i not in last_age_gender):
-                    try:
-                        analysis = DeepFace.analyze(
-                            rgb[y1:y2, x1:x2],
-                            actions=["age", "gender"],
-                            enforce_detection=False,
-                            silent=True
-                        )
-                        age = analysis[0]["age"]
-                        gender = analysis[0]["dominant_gender"]
-                        last_age_gender[i] = (age, gender)
-                        last_analysis_time = now
-                    except Exception:
-                        last_age_gender[i] = ("?", "?")
+            # fine while
+        except queue.Empty:
+            pass
 
-                age, gender = last_age_gender.get(i, ("?", "?"))
 
-                # ====== DISEGNA BOX ======
-                label = f"{name} ({gender}, {age})"
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, label, (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        # --- 🔹 Mostra frame
+        cv2.imshow("Face Recognition Live", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            exit_event.set()
+            break
 
-            except Exception as e:
-                print(f"⚠️ Errore su volto {i}: {e}")
-                continue
+    # --- 🔹 Cleanup finale
+    shutdown_tts_executor()
+    cap.release()
+    cv2.destroyAllWindows()
+    exit_event.set()
+    print("\n✅ Chiusura completata.")
 
-    cv2.imshow("Face Recognition Live", frame)
 
-    # 🔚 Esci con 'q'
-    if exit_flag:
-        print("\n👋 Terminazione richiesta, chiusura...")
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+# ==========================================
+# 🚀 AVVIO
+# ==========================================
+if __name__ == "__main__":
+    main()
