@@ -43,7 +43,6 @@ def get_face_embedding_from_frame(frame, box):
 
     return None
 
-
 def compare_embeddings(emb1, emb2, threshold=1.0):
     distance = np.linalg.norm(emb1 - emb2)
     return distance < threshold, distance
