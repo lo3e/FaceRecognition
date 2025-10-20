@@ -10,8 +10,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_num_threads(2)  # evita saturazione CPU se non usi GPU
 print(f"async_core: using device {DEVICE}")
 
-# GLOBAL executor per TTS
+# ==========================================================
+# 🎧 EXECUTOR PER TTS E OLLAMA
+# ==========================================================
+
 _tts_executor = None
+_ollama_executor = None
 
 # Queues
 detect_request_q = queue.Queue(maxsize=2)   # main -> detection worker (push frames)
@@ -118,29 +122,52 @@ def tts_worker(speak_func):
         finally:
             tts_q.task_done()
 
-def start_tts_executor(max_workers=1):
-    global _tts_executor
+def start_executors():
+    """Inizializza gli executor per TTS e Ollama."""
+    global _tts_executor, _ollama_executor
     if _tts_executor is None:
-        _tts_executor = ThreadPoolExecutor(max_workers=max_workers)
-        print("async_core: TTS ThreadPoolExecutor avviato")
+        _tts_executor = ThreadPoolExecutor(max_workers=1)
+        print("🔊 Executor TTS avviato")
+    if _ollama_executor is None:
+        _ollama_executor = ThreadPoolExecutor(max_workers=1)
+        print("🧠 Executor Ollama avviato")
+
+def shutdown_executors():
+    """Chiude gli executor in modo pulito."""
+    global _tts_executor, _ollama_executor
+    if _tts_executor:
+        _tts_executor.shutdown(wait=True)
+        print("🔊 Executor TTS chiuso")
+        _tts_executor = None
+    if _ollama_executor:
+        _ollama_executor.shutdown(wait=True)
+        print("🧠 Executor Ollama chiuso")
+        _ollama_executor = None
 
 def speak_async(func, *args, **kwargs):
-    """Sottomette la funzione speak in background. Ritorna future."""
+    """Esegue la funzione TTS in background."""
     if _tts_executor is None:
-        start_tts_executor()
+        start_executors()
     return _tts_executor.submit(func, *args, **kwargs)
 
-def shutdown_tts_executor():
-    global _tts_executor
-    if _tts_executor is not None:
-        _tts_executor.shutdown(wait=True)
-        _tts_executor = None
-        print("async_core: TTS executor chiuso")
+def ask_ollama_async(func, *args, **kwargs):
+    """Esegue la chiamata a Ollama in background."""
+    if _ollama_executor is None:
+        start_executors()
+    return _ollama_executor.submit(func, *args, **kwargs)
 
 def start_workers(speak_func=None):
-    # avvia detection & embedding worker come prima...
+    """
+    Avvia tutti i thread asincroni e gli executor necessari:
+      - detection_worker (MTCNN)
+      - embedding_worker (ResNet)
+      - executor TTS e Ollama
+    """
+    # === 1️⃣ AVVIO WORKER DI RILEVAZIONE E EMBEDDING ===
     threading.Thread(target=detection_worker, daemon=True).start()
     threading.Thread(target=embedding_worker, daemon=True).start()
-    # inizializza l'executor per TTS
-    start_tts_executor(max_workers=1)
+
+    # === 2️⃣ AVVIO EXECUTOR TTS + OLLAMA ===
+    start_executors()   # <-- sostituisce start_tts_executor()
+
     print("async_core: workers started")

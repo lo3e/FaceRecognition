@@ -18,9 +18,9 @@ from utils.dialog_manager import ask_ollama
 from utils.async_core import (
     detect_request_q, detect_result_q,
     embed_request_q, embed_result_q,
-    tts_q, start_workers, exit_event,
-    speak_async, shutdown_tts_executor,
-    worker_ready_event
+    start_workers, exit_event,
+    speak_async, shutdown_executors,
+    worker_ready_event, ask_ollama_async
 )
 
 # ==========================================
@@ -47,7 +47,7 @@ def key_listener():
 # 🔊 INTERAZIONE (TTS + STT + LLM)
 # ==========================================
 
-def handle_interaction(name: str):
+'''def handle_interaction(name: str):
     try:
         greeting = f"Ciao {name}!" if name != "Volto rilevato" else "Ciao, piacere di conoscerti!"
 
@@ -64,11 +64,56 @@ def handle_interaction(name: str):
             return
 
         # 🔹 4. elabora con Ollama in background
-        reply_future = ask_ollama(user_text)
+        reply_future = ask_ollama_async(ask_ollama, user_text)
         reply = reply_future.result(timeout=10)
 
         # 🔹 5. parla la risposta (non blocca)
         speak_async(speak, reply)
+        print(f"🔊  [TTS] Ho detto: \"{reply}\"\n")
+
+    except Exception as e:
+        print(f"[INTERACT] Errore: {e}")
+'''
+
+def handle_interaction(name: str):
+    try:
+        greeting = f"Ciao {name}!" if name != "Volto rilevato" else "Ciao, piacere di conoscerti!"
+        speak_async(speak, greeting).result()
+        time.sleep(0.6)
+
+        conversation_active = True
+        silence_counter = 0
+
+        while conversation_active and not exit_event.is_set():
+            user_text = transcribe_audio(duration=6, stop_on_silence=True).strip()
+            if not user_text:
+                silence_counter += 1
+                if silence_counter > 3:
+                    print("🕓 Nessun parlato per troppo tempo, termino la conversazione.")
+                    break
+                continue
+            else:
+                silence_counter = 0
+
+            silence_counter = 0
+            print(f"🗣️  [STT] Hai detto: \"{user_text}\"")
+
+            # elabora con Ollama
+            reply_future = ask_ollama_async(ask_ollama, user_text)
+            reply = reply_future.result(timeout=20)
+            print(f"🤖  [LLM] Risposta: \"{reply}\"")
+
+            # parla
+            speak_async(speak, reply).result()
+            print(f"🔊  [TTS] Ho detto: \"{reply}\"\n")
+
+            # piccola pausa per evitare eco
+            time.sleep(0.8)
+
+            # opzionale: uscita manuale
+            if user_text.lower() in ["esci", "stop", "basta", "arrivederci"]:
+                print("👋  Conversazione terminata su comando vocale.")
+                conversation_active = False
 
     except Exception as e:
         print(f"[INTERACT] Errore: {e}")
@@ -175,23 +220,35 @@ def main():
                         del trackers[fid]
                         del track_lost[fid]
 
-        # --- 🔹 Se abbiamo nuove detection → reset tracker
+        # --- 🔹 Gestione dei tracker (crea nuovi, aggiorna, rimuove persi)
         if boxes is not None:
             boxes = [b for b in boxes if b is not None]
-            trackers.clear()
-            track_lost.clear()
             for b in boxes:
                 x1, y1, x2, y2 = map(int, b)
                 w, h = x2 - x1, y2 - y1
-                tracker = (
-                    cv2.legacy.TrackerCSRT_create()
-                    if hasattr(cv2.legacy, "TrackerCSRT_create")
-                    else cv2.TrackerCSRT_create()
-                )
-                trackers[f"t{next_face_id}"] = tracker
-                tracker.init(frame, (x1, y1, w, h))
-                track_lost[f"t{next_face_id}"] = 0
-                next_face_id += 1
+                new_box = (x1, y1, w, h)
+
+                # 🔹 evita duplicati: controlla se esiste già un tracker vicino
+                duplicate = False
+                for tid, tr in trackers.items():
+                    ok, box = tr.update(frame)
+                    if ok:
+                        bx, by, bw, bh = box
+                        if abs(bx - x1) < 30 and abs(by - y1) < 30:
+                            duplicate = True
+                            break
+
+                if not duplicate:
+                    tracker = (
+                        cv2.legacy.TrackerCSRT_create()
+                        if hasattr(cv2.legacy, "TrackerCSRT_create")
+                        else cv2.TrackerCSRT_create()
+                    )
+                    trackers[f"t{next_face_id}"] = tracker
+                    tracker.init(frame, new_box)
+                    track_lost[f"t{next_face_id}"] = 0
+                    print(f"🆕 Nuovo tracker t{next_face_id} creato {new_box}")
+                    next_face_id += 1
 
         # --- 🔹 Disegna box e invia embedding request
         if boxes is not None:
@@ -242,7 +299,7 @@ def main():
             break
 
     # --- 🔹 Cleanup finale
-    shutdown_tts_executor()
+    shutdown_executors()
     cap.release()
     cv2.destroyAllWindows()
     exit_event.set()

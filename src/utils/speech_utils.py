@@ -40,7 +40,7 @@ rec = KaldiRecognizer(model, 16000)
     return text
     '''
 
-def transcribe_audio(duration=3, stop_on_silence=False):
+def transcribe_audio(duration=6, stop_on_silence=True, silence_duration=1.5):
     """
     Registra audio dal microfono per un massimo di `duration` secondi.
     Se stop_on_silence=True, interrompe la registrazione se non rileva parlato.
@@ -50,12 +50,14 @@ def transcribe_audio(duration=3, stop_on_silence=False):
     CHUNK = 1024
     FORMAT = pyaudio.paInt16
     CHANNELS = 1
-    SILENCE_THRESHOLD = 500  # più alto = meno sensibile
-    SILENCE_LIMIT = 1.2      # secondi di silenzio consecutivo per interrompere
+    SILENCE_THRESHOLD = 300  # più alto = meno sensibile
+    SILENCE_LIMIT = 1.0      # secondi di silenzio consecutivo per interrompere
+    MIC_INDEX = 2  # Cambia in base al tuo sistema
 
     p = pyaudio.PyAudio()
     stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
-                    input=True, frames_per_buffer=CHUNK)
+                    input=True, input_device_index=MIC_INDEX,
+                    frames_per_buffer=CHUNK)
 
     print("🎙️ In ascolto...")
 
@@ -64,10 +66,15 @@ def transcribe_audio(duration=3, stop_on_silence=False):
     start_time = time.time()
 
     while True:
-        data = stream.read(CHUNK)
+        data = stream.read(CHUNK, exception_on_overflow=False)
+        if not data:
+            print("⚠️ Nessun dato audio, chiudo microfono (nessun input).")
+            break
+
         frames.append(data)
 
         rms = audioop.rms(data, 2)
+
         if stop_on_silence:
             if rms < SILENCE_THRESHOLD:
                 silent_chunks += 1
@@ -76,14 +83,19 @@ def transcribe_audio(duration=3, stop_on_silence=False):
 
             # interrompe se c'è troppo silenzio
             if silent_chunks * CHUNK / RATE > SILENCE_LIMIT:
+                print("🔇  [MIC] Silenzio rilevato, chiusura microfono.")
                 break
 
         if time.time() - start_time > duration:
+            print("⏱️  [MIC] Tempo massimo raggiunto, chiusura microfono.")
             break
+
+        time.sleep(0.001)
 
     stream.stop_stream()
     stream.close()
     p.terminate()
+    print("✅  [MIC] Microfono chiuso. Elaborazione...\n")
 
     # salva temporaneamente
     wf = wave.open("temp_audio.wav", 'wb')
@@ -97,5 +109,6 @@ def transcribe_audio(duration=3, stop_on_silence=False):
     rec = KaldiRecognizer(model, RATE)
     with open("temp_audio.wav", "rb") as f:
         rec.AcceptWaveform(f.read())
-    text = json.loads(rec.FinalResult()).get("text", "")
-    return text.strip()
+    text = json.loads(rec.FinalResult()).get("text", "").strip()
+    print(f"🗣️  [STT] Hai detto: \"{text}\"")
+    return text
