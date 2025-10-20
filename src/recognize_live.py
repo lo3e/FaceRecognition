@@ -18,9 +18,10 @@ from utils.dialog_manager import ask_ollama
 from utils.async_core import (
     detect_request_q, detect_result_q,
     embed_request_q, embed_result_q,
-    tts_q, start_workers, exit_event,
-    speak_async, shutdown_tts_executor,
-    worker_ready_event
+    start_workers, exit_event,
+    speak_async, shutdown_executors,
+    worker_ready_event, ask_ollama_async,
+    embedding_ready_event
 )
 
 # ==========================================
@@ -28,6 +29,36 @@ from utils.async_core import (
 # ==========================================
 
 EMB_FILE = "../data/embeddings.pkl"
+
+# 🔧 Configurazione ottimizzata
+TRACKER_MAX_LOST = 15  # 🔧 Aumentato da 8 (più tollerante)
+EMBED_INTERVAL = 20.0   # 🔧 Secondi tra embedding dello stesso tracker
+RESEEN_THRESHOLD = 30  # 🔧 Secondi prima di ri-salutare
+IOU_THRESHOLD = 0.3    # 🔧 Soglia IoU per matching
+
+# ==========================================
+# 🧮 UTILITY FUNCTIONS
+# ==========================================
+
+def iou(box1, box2):
+    """
+    Calcola Intersection over Union tra due box.
+    box format: (x, y, w, h)
+    """
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    
+    xi1 = max(x1, x2)
+    yi1 = max(y1, y2)
+    xi2 = min(x1 + w1, x2 + w2)
+    yi2 = min(y1 + h1, y2 + h2)
+    
+    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    box1_area = w1 * h1
+    box2_area = w2 * h2
+    union_area = box1_area + box2_area - inter_area
+    
+    return inter_area / union_area if union_area > 0 else 0
 
 # ==========================================
 # ⌨️ ASCOLTO TASTO 'Q'
@@ -50,25 +81,46 @@ def key_listener():
 def handle_interaction(name: str):
     try:
         greeting = f"Ciao {name}!" if name != "Volto rilevato" else "Ciao, piacere di conoscerti!"
+        
+        # 🔧 FIX: Aspetta che TTS finisca COMPLETAMENTE
+        speak_async(speak, greeting).result()
+        
+        # 🔧 FIX: Pausa più lunga per evitare eco (era 0.6)
+        time.sleep(1.5)
+        
+        conversation_active = True
+        silence_counter = 0
 
-        # 🔹 1. parla (blocca solo questo thread)
-        future = speak_async(speak, greeting)
-        future.result()  # aspetta che finisca il saluto
+        while conversation_active and not exit_event.is_set():
+            user_text = transcribe_audio(duration=6, stop_on_silence=True).strip()
+            
+            if not user_text:
+                silence_counter += 1
+                if silence_counter > 3:
+                    print("🕓 Nessun parlato per troppo tempo, termino la conversazione.")
+                    break
+                continue
+            else:
+                silence_counter = 0
 
-        # 🔹 2. breve pausa per evitare di catturare l'audio del TTS
-        time.sleep(0.6)
+            print(f"🗣️  [STT] Hai detto: \"{user_text}\"")
 
-        # 🔹 3. ascolta ora
-        user_text = transcribe_audio(duration=3, stop_on_silence=True).strip()
-        if not user_text:
-            return
+            # elabora con Ollama
+            reply_future = ask_ollama_async(ask_ollama, user_text)
+            reply = reply_future.result(timeout=20)
+            print(f"🤖  [LLM] Risposta: \"{reply}\"")
 
-        # 🔹 4. elabora con Ollama in background
-        reply_future = ask_ollama(user_text)
-        reply = reply_future.result(timeout=10)
+            # 🔧 FIX: Aspetta che TTS finisca
+            speak_async(speak, reply).result()
+            print(f"🔊  [TTS] Ho detto: \"{reply}\"\n")
 
-        # 🔹 5. parla la risposta (non blocca)
-        speak_async(speak, reply)
+            # 🔧 FIX: Pausa più lunga dopo TTS
+            time.sleep(1.2)
+
+            # opzionale: uscita manuale
+            if user_text.lower() in ["esci", "stop", "basta", "arrivederci"]:
+                print("👋  Conversazione terminata su comando vocale.")
+                conversation_active = False
 
     except Exception as e:
         print(f"[INTERACT] Errore: {e}")
@@ -94,16 +146,16 @@ def load_known_faces():
 
 def main():
     # === AVVIO WORKER E TRACKER ===
-    # Avvia worker asincroni
     start_workers(speak_func=speak)
 
     print("🔊 Warm-up TTS...")
-    speak(" ")  # una parola vuota, inizializza engine
+    speak(" ")
     print("✅ TTS pronto.")
 
-    print("🕐 Attendo che il detection worker completi il warm-up...")
+    print("🕐 Attendo che i worker completino il warm-up...")
     worker_ready_event.wait()
-    print("✅ Detection worker pronto. Avvio webcam.")
+    embedding_ready_event.wait()
+    print("✅ Tutti i worker pronti. Avvio webcam.")
 
     # Carica database
     known_faces = load_known_faces()
@@ -117,11 +169,15 @@ def main():
     print("\n🎬 Avvio riconoscimento live...")
     print("Premi 'q' per uscire.\n")
 
-    seen_names = set()
+    # 🔧 FIX: seen_names ora è un dict con timestamp
+    seen_names = {}  # name -> timestamp ultimo saluto
+    active_interactions = {}  # name/id -> thread attiva
+    
     trackers = {}            # id → tracker
     track_lost = {}          # id → contatore frame persi
+    tracker_boxes = {}       # id → (x, y, w, h) ultima box nota
+    last_embed_time = {}     # id → timestamp ultimo embedding
     next_face_id = 0
-    TRACKER_MAX_LOST = 8
     frame_id = 0
 
     # Avvia thread per ascolto tasto 'q'
@@ -138,6 +194,7 @@ def main():
         frame = cv2.resize(frame, (640, 480))
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_id += 1
+        current_time = time.time()
 
         # --- 🔹 Invia frame al detection worker (max 1 alla volta)
         if detect_request_q.qsize() < 1:
@@ -150,68 +207,120 @@ def main():
         boxes = None
         try:
             while not detect_result_q.empty():
-                fid, result = detect_result_q.get_nowait()
+                det_fid, result = detect_result_q.get_nowait()
                 detect_result_q.task_done()
                 boxes = result
-                #if boxes is not None and len(boxes) > 0:
-                #    print(f"[MAIN] Ricevute {len(boxes)} box dal detection worker")
-                #else:
-                #    print("[MAIN] Nessuna box ricevuta dal detection worker")
         except queue.Empty:
             pass
 
         # --- 🔹 Se nessuna detection, aggiorna tracker esistenti
         if boxes is None and trackers:
             boxes = []
-            for fid, tr in list(trackers.items()):
+            for tid, tr in list(trackers.items()):
                 ok, box = tr.update(frame)
                 if ok:
                     x, y, w, h = map(int, box)
                     boxes.append([x, y, x + w, y + h])
-                    track_lost[fid] = 0
+                    track_lost[tid] = 0
+                    tracker_boxes[tid] = (x, y, w, h)
                 else:
-                    track_lost[fid] += 1
-                    if track_lost[fid] > TRACKER_MAX_LOST:
-                        del trackers[fid]
-                        del track_lost[fid]
+                    track_lost[tid] += 1
+                    # 🔧 FIX: Più tollerante prima di rimuovere
+                    if track_lost[tid] > TRACKER_MAX_LOST:
+                        print(f"❌ Tracker {tid} perso definitivamente")
+                        del trackers[tid]
+                        del track_lost[tid]
+                        tracker_boxes.pop(tid, None)
+                        last_embed_time.pop(tid, None)
 
-        # --- 🔹 Se abbiamo nuove detection → reset tracker
+        # --- 🔹 Gestione dei tracker (crea nuovi, aggiorna, rimuove persi)
         if boxes is not None:
             boxes = [b for b in boxes if b is not None]
-            trackers.clear()
-            track_lost.clear()
+
+            updated_trackers = {}
+            matched_ids = set()
+
             for b in boxes:
                 x1, y1, x2, y2 = map(int, b)
                 w, h = x2 - x1, y2 - y1
-                tracker = (
-                    cv2.legacy.TrackerCSRT_create()
-                    if hasattr(cv2.legacy, "TrackerCSRT_create")
-                    else cv2.TrackerCSRT_create()
-                )
-                trackers[f"t{next_face_id}"] = tracker
-                tracker.init(frame, (x1, y1, w, h))
-                track_lost[f"t{next_face_id}"] = 0
-                next_face_id += 1
+                new_box = (x1, y1, w, h)
 
-        # --- 🔹 Disegna box e invia embedding request
-        if boxes is not None:
-            for i, box in enumerate(boxes):
-                x1, y1, x2, y2 = map(int, box)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                face_id = f"face_{i}"
+                # 🔧 FIX: Matching basato su IoU
+                best_iou = IOU_THRESHOLD
+                matched_id = None
+                
+                for tid in list(trackers.keys()):
+                    if tid in matched_ids:
+                        continue
+                    
+                    if tid in tracker_boxes:
+                        current_iou = iou(new_box, tracker_boxes[tid])
+                        if current_iou > best_iou:
+                            best_iou = current_iou
+                            matched_id = tid
+
+                # 🔹 Se trovato match, re-inizializza tracker
+                if matched_id is not None:
+                    trackers[matched_id].init(frame, new_box)
+                    updated_trackers[matched_id] = trackers[matched_id]
+                    tracker_boxes[matched_id] = new_box
+                    track_lost[matched_id] = 0
+                    matched_ids.add(matched_id)
+                else:
+                    # 🔹 Crea nuovo tracker
+                    tracker = (
+                        cv2.legacy.TrackerCSRT_create()
+                        if hasattr(cv2.legacy, "TrackerCSRT_create")
+                        else cv2.TrackerCSRT_create()
+                    )
+                    tid = f"t{next_face_id}"
+                    tracker.init(frame, new_box)
+                    updated_trackers[tid] = tracker
+                    tracker_boxes[tid] = new_box
+                    track_lost[tid] = 0
+                    print(f"🆕 Nuovo tracker {tid} creato {new_box}")
+                    next_face_id += 1
+                    matched_ids.add(tid)
+
+            trackers = updated_trackers
+
+        # --- 🔹 Disegna box e invia embedding request (con rate limiting)
+        for tid, tr in list(trackers.items()):
+            ok, box = tr.update(frame)
+            
+            if not ok or box is None:
+                track_lost[tid] += 1
+                if track_lost[tid] > TRACKER_MAX_LOST:
+                    print(f"❌ Tracker {tid} perso, rimosso")
+                    trackers.pop(tid, None)
+                    track_lost.pop(tid, None)
+                    tracker_boxes.pop(tid, None)
+                    last_embed_time.pop(tid, None)
+                continue
+            
+            x, y, w, h = map(int, box)
+            
+            if w <= 0 or h <= 0:
+                track_lost[tid] += 1
+                continue
+            
+            track_lost[tid] = 0
+            tracker_boxes[tid] = (x, y, w, h)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            # 🔧 FIX: Rate limiting embedding request
+            if tid not in last_embed_time or current_time - last_embed_time[tid] > EMBED_INTERVAL:
                 if not embed_request_q.full():
                     try:
-                        embed_request_q.put_nowait((face_id, rgb.copy(), box))
-                        #print(f"[EMBED-REQ] Enqueued embedding for {face_id}")
+                        embed_request_q.put_nowait((tid, rgb.copy(), (x, y, x + w, y + h)))
+                        last_embed_time[tid] = current_time
                     except queue.Full:
                         pass
 
         # --- 🔹 Legge eventuali embedding pronti
         try:
             while not embed_result_q.empty():
-                print("[MAIN] Checking embedding results…")
-                fid, embedding = embed_result_q.get_nowait()
-                print(f"[MAIN] Got embedding for {fid}")
+                emb_fid, embedding = embed_result_q.get_nowait()
                 embed_result_q.task_done()
 
                 name = "Volto rilevato"
@@ -224,16 +333,37 @@ def main():
                             name = person
                             break
 
-                # 🔊 Se volto nuovo, avvia interazione vocale
-                if name not in seen_names:
-                    seen_names.add(name)
-                    print(f"👁️  Nuovo volto rilevato: {name}")
-                    threading.Thread(target=handle_interaction, args=(name,), daemon=True).start()
+                # === 🔧 FIX: evita doppie interazioni ===
+                current_time = time.time()
+                # se sconosciuto → usa id tracker come chiave unica
+                display_key = name if name != "Volto rilevato" else emb_fid
 
-            # fine while
+                # Controlla se è già attiva un’interazione per questo volto
+                existing = active_interactions.get(display_key)
+                if existing and getattr(existing, "is_alive", lambda: False)():
+                    # già in conversazione, aggiorna solo timestamp e salta
+                    seen_names[name] = current_time
+                    continue
+
+                # Controlla cooldown per ri-saluto
+                if name not in seen_names or current_time - seen_names[name] > RESEEN_THRESHOLD:
+                    seen_names[name] = current_time
+                    print(f"👁️  Nuovo volto rilevato: {name}")
+
+                    # Avvia nuova interazione in thread dedicato
+                    th = threading.Thread(target=handle_interaction, args=(name,), daemon=True)
+                    active_interactions[display_key] = th
+                    th.start()
+
+                    # Thread watcher che rimuove la entry a fine interazione
+                    def _cleanup_thread(t, key):
+                        t.join()
+                        active_interactions.pop(key, None)
+
+                    threading.Thread(target=_cleanup_thread, args=(th, display_key), daemon=True).start()
+
         except queue.Empty:
             pass
-
 
         # --- 🔹 Mostra frame
         cv2.imshow("Face Recognition Live", frame)
@@ -242,7 +372,7 @@ def main():
             break
 
     # --- 🔹 Cleanup finale
-    shutdown_tts_executor()
+    shutdown_executors()
     cap.release()
     cv2.destroyAllWindows()
     exit_event.set()
