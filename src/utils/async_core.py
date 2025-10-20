@@ -7,8 +7,20 @@ from concurrent.futures import ThreadPoolExecutor
 from facenet_pytorch import MTCNN, InceptionResnetV1
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.set_num_threads(2)  # evita saturazione CPU se non usi GPU
-print(f"async_core: using device {DEVICE}")
+torch.set_num_threads(2)
+print(f"✅ async_core: using device {DEVICE}")
+
+# ==========================================================
+# 🧠 MODELLI GLOBALI (UNICA ISTANZA)
+# ==========================================================
+
+# 🔧 FIX: Un solo ResNet condiviso tra tutti i worker
+resnet = InceptionResnetV1(pretrained='vggface2').eval().to(DEVICE)
+
+# 🔧 FIX: MTCNN globale per detection (creata nel worker con warm-up)
+mtcnn_global = None
+
+print("⚙️ Caricamento modelli in corso...")
 
 # ==========================================================
 # 🎧 EXECUTOR PER TTS E OLLAMA
@@ -18,98 +30,168 @@ _tts_executor = None
 _ollama_executor = None
 
 # Queues
-detect_request_q = queue.Queue(maxsize=2)   # main -> detection worker (push frames)
-detect_result_q  = queue.Queue(maxsize=4)   # detection worker -> main (boxes)
-embed_request_q  = queue.Queue(maxsize=4)   # main -> embedding worker
+detect_request_q = queue.Queue(maxsize=2)
+detect_result_q  = queue.Queue(maxsize=4)
+embed_request_q  = queue.Queue(maxsize=4)
 embed_result_q   = queue.Queue(maxsize=8)
 tts_q            = queue.Queue(maxsize=8)
 exit_event       = threading.Event()
-embed_semaphore  = threading.Semaphore(1)   # one embedding at a time
-
-# Initialize models here (warm-up)
-resnet = InceptionResnetV1(pretrained='vggface2').eval().to(DEVICE)
-
-print("⚙️ GPU warm-up in corso...")
-
-# === WARM-UP GPU (ResNet + MTCNN) ===
-
-# 🔹 Warm-up ResNet (embedding model)
-with torch.no_grad():
-    dummy_tensor = torch.zeros((1, 3, 160, 160), device=DEVICE)
-    _ = resnet(dummy_tensor)
-
-print(f"✅ GPU warm-up ResNet completato su {DEVICE}")
+embed_semaphore  = threading.Semaphore(1)
 
 # ==========================================================
-# 🧩 EVENTO DI SINCRONIZZAZIONE DEI WORKER
+# 🔥 WARM-UP COMPLETO GPU
+# ==========================================================
+
+print("🔥 GPU warm-up in corso...")
+
+# 🔧 FIX: Warm-up ResNet con tensore realistico
+with torch.no_grad():
+    dummy_tensor = torch.randn((1, 3, 160, 160), device=DEVICE)  # Random invece di zeros
+    _ = resnet(dummy_tensor)
+
+print(f"✅ ResNet warm-up completato su {DEVICE}")
+
+# ==========================================================
+# 🧩 EVENTI DI SINCRONIZZAZIONE
 # ==========================================================
 
 worker_ready_event = threading.Event()
+embedding_ready_event = threading.Event()
 
-# Detection worker: consumes frames (rgb) and returns boxes
+# ==========================================================
+# 📸 DETECTION WORKER (MTCNN)
+# ==========================================================
+
 def detection_worker():
-    print("📸 Detection worker avviato (istanza MTCNN locale).")
-    local_mtcnn = MTCNN(
+    """Worker per detection volti con MTCNN."""
+    global mtcnn_global
+    
+    print("📸 Detection worker avviato...")
+    
+    # 🔧 FIX: MTCNN con parametri ottimizzati
+    mtcnn_global = MTCNN(
         keep_all=True,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        min_face_size=40,
-        thresholds=[0.5, 0.6, 0.7]
+        device=DEVICE,
+        min_face_size=60,  # 🔧 Aumentato da 40 (meno falsi positivi)
+        thresholds=[0.6, 0.7, 0.8],  # 🔧 Più restrittivo (era [0.5, 0.6, 0.7])
+        post_process=True  # Allineamento automatico
     )
-
-    # 🔹 Warm-up reale su frame 480x640 (simile alla webcam)
+    
+    # 🔧 FIX: Warm-up MTCNN completo con più passaggi
+    print("🔥 MTCNN warm-up (3 passaggi)...")
     dummy_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    _ = local_mtcnn.detect(dummy_frame)
+    
+    for i in range(3):
+        _ = mtcnn_global.detect(dummy_frame)
+    
     print("✅ MTCNN warm-up completato (worker ready).")
-
     worker_ready_event.set()
-
+    
     while not exit_event.is_set():
         try:
             fid, frame_rgb = detect_request_q.get(timeout=0.1)
         except queue.Empty:
             continue
-
-        # Copia per sicurezza per evitare corruzione del buffer
+        
+        # Copia per sicurezza
         frame_rgb = np.ascontiguousarray(frame_rgb.copy())
-
+        
         try:
-            boxes, probs = local_mtcnn.detect(frame_rgb)
+            boxes, probs = mtcnn_global.detect(frame_rgb)
+            
+            # 🔧 FIX: Filtra box troppo piccole o con bassa confidence
+            if boxes is not None and probs is not None:
+                filtered_boxes = []
+                for box, prob in zip(boxes, probs):
+                    x1, y1, x2, y2 = box
+                    w, h = x2 - x1, y2 - y1
+                    
+                    # Filtra: min 80x80px e confidence > 0.9
+                    if w >= 80 and h >= 80 and prob > 0.9:
+                        filtered_boxes.append(box)
+                
+                boxes = filtered_boxes if filtered_boxes else None
+        
         except Exception as e:
             print(f"[DETECT] Errore su frame {fid}: {e}")
             boxes = None
-
+        
         detect_result_q.put((fid, boxes))
         detect_request_q.task_done()
 
-        #if boxes is not None:
-        #    print(f"[DETECT] frame {fid}: trovate {len(boxes)} facce.")
-        #else:
-        #    print(f"[DETECT] frame {fid}: nessuna faccia trovata.")
+# ==========================================================
+# 🧬 EMBEDDING WORKER (ResNet)
+# ==========================================================
 
-# Embedding worker (keeps as before, but calls resnet from here)
 def embedding_worker():
+    """Worker per generazione embedding con preprocessing corretto."""
+    print("🧬 Embedding worker avviato...")
+    
+    # 🔧 FIX: Warm-up embedding worker
+    print("🔥 Embedding worker warm-up...")
+    dummy_face = np.random.randint(0, 255, (160, 160, 3), dtype=np.uint8)
+    dummy_tensor = torch.tensor(dummy_face).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    dummy_tensor = dummy_tensor.to(DEVICE)
+    
+    with torch.no_grad():
+        _ = resnet(dummy_tensor)
+    
+    print("✅ Embedding worker pronto.")
+    embedding_ready_event.set()
+    
     while not exit_event.is_set():
         try:
             face_id, frame_rgb, box = embed_request_q.get(timeout=0.5)
-            #print(f"[EMBED-WORKER] Received {face_id}")
         except queue.Empty:
             continue
+        
         with embed_semaphore:
             try:
-                x1,y1,x2,y2 = [int(v) for v in box]
+                x1, y1, x2, y2 = [int(v) for v in box]
+                
+                # 🔧 FIX: Aggiungi margine per migliorare allineamento
+                h, w, _ = frame_rgb.shape
+                margin = 10
+                x1 = max(0, x1 - margin)
+                y1 = max(0, y1 - margin)
+                x2 = min(w, x2 + margin)
+                y2 = min(h, y2 + margin)
+                
                 face = frame_rgb[y1:y2, x1:x2]
-                face_tensor = torch.tensor(face).permute(2,0,1).unsqueeze(0).float()/255.0
-                face_tensor = torch.nn.functional.interpolate(face_tensor, size=(160,160)).to(DEVICE)
+                
+                if face.size == 0:
+                    continue
+                
+                # 🔧 FIX: Preprocessing migliorato (simile a MTCNN)
+                face_tensor = torch.tensor(face).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+                face_tensor = torch.nn.functional.interpolate(
+                    face_tensor, 
+                    size=(160, 160), 
+                    mode='bilinear',  # 🔧 Migliorato da default
+                    align_corners=False
+                ).to(DEVICE)
+                
+                # 🔧 FIX: Normalizzazione come FaceNet
+                mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(DEVICE)
+                std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(DEVICE)
+                face_tensor = (face_tensor - mean) / std
+                
                 with torch.no_grad():
                     emb = resnet(face_tensor).cpu().numpy()
+                
                 embed_result_q.put((face_id, emb))
+                
             except Exception as e:
-                print("async_core: embedding_worker error:", e)
+                print(f"[EMBED] Errore: {e}")
             finally:
                 embed_request_q.task_done()
 
-# TTS worker (wrap speak)
+# ==========================================================
+# 🔊 TTS WORKER
+# ==========================================================
+
 def tts_worker(speak_func):
+    """Worker per Text-To-Speech."""
     while not exit_event.is_set():
         try:
             text = tts_q.get(timeout=0.5)
@@ -118,9 +200,13 @@ def tts_worker(speak_func):
         try:
             speak_func(text)
         except Exception as e:
-            print("async_core: tts_worker error:", e)
+            print(f"[TTS] Errore: {e}")
         finally:
             tts_q.task_done()
+
+# ==========================================================
+# 🎯 EXECUTOR MANAGEMENT
+# ==========================================================
 
 def start_executors():
     """Inizializza gli executor per TTS e Ollama."""
@@ -156,6 +242,10 @@ def ask_ollama_async(func, *args, **kwargs):
         start_executors()
     return _ollama_executor.submit(func, *args, **kwargs)
 
+# ==========================================================
+# 🚀 START WORKERS
+# ==========================================================
+
 def start_workers(speak_func=None):
     """
     Avvia tutti i thread asincroni e gli executor necessari:
@@ -163,11 +253,8 @@ def start_workers(speak_func=None):
       - embedding_worker (ResNet)
       - executor TTS e Ollama
     """
-    # === 1️⃣ AVVIO WORKER DI RILEVAZIONE E EMBEDDING ===
     threading.Thread(target=detection_worker, daemon=True).start()
     threading.Thread(target=embedding_worker, daemon=True).start()
-
-    # === 2️⃣ AVVIO EXECUTOR TTS + OLLAMA ===
-    start_executors()   # <-- sostituisce start_tts_executor()
-
-    print("async_core: workers started")
+    start_executors()
+    
+    print("✅ Tutti i worker avviati")
