@@ -4,11 +4,12 @@ import wave
 import time
 import json
 import os
+import re
 from vosk import Model, KaldiRecognizer
 import pyttsx3
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.abspath(os.path.join(BASE_DIR, "../../models/vosk-model-small-it-0.22"))
+# ================== CONFIGURAZIONE MODELLO VOSK ==================
+EXTERNAL_MODEL_DIR = r"C:\Users\brain\Documents\Universita\Erasmus\Proggetto\Dati\vosk-model-it-0.22"
 
 def speak(text):
     engine = pyttsx3.init() 
@@ -20,7 +21,7 @@ def speak(text):
     engine.runAndWait()
 
 # MODEL_PATH deve già essere definito come fai ora
-model = Model(MODEL_PATH)
+model = Model(EXTERNAL_MODEL_DIR)
 # ==========================================================
 
 def find_working_mic(trials_rates=(16000, 48000), trials_channels=(1, 2), timeout=1.0):
@@ -97,11 +98,12 @@ def _to_mono_and_resample(raw_bytes, width, in_channels, in_rate, out_rate=16000
     else:
         return mono
 
-
-def transcribe_audio(duration=8, stop_on_silence=True, silence_limit=1.8):
+def transcribe_audio(duration=20, stop_on_silence=True, silence_limit=1.5, silence_hangover=2.2):
     """
-    Registrazione robusta con auto-rilevamento microfono e stop sul silenzio.
-    Più tollerante, evita chiusure premature.
+    Registrazione robusta:
+     - durata massima `duration` secondi
+     - se stop_on_silence=True aspetta silence_hangover secondi DI SILENZIO DOPO L'ULTIMO PARLATO rilevato
+     - ritorna stringa trascritta
     """
     dev_idx, dev_rate, dev_ch = find_working_mic()
     if dev_idx is None:
@@ -113,10 +115,8 @@ def transcribe_audio(duration=8, stop_on_silence=True, silence_limit=1.8):
     MIC_INDEX = dev_idx
     CHUNK = 2048
     FORMAT = pyaudio.paInt16
-    SILENCE_THRESHOLD = 400  # più alto = meno sensibile
 
-    print(f"🎙️ [MIC] Apertura microfono index={MIC_INDEX} ({CHANNELS} ch @ {RATE}Hz)")
-
+    #print(f"🎙️ [MIC] Apertura microfono index={MIC_INDEX} ({CHANNELS} ch @ {RATE}Hz)")
     p = pyaudio.PyAudio()
     try:
         stream = p.open(format=FORMAT,
@@ -132,36 +132,54 @@ def transcribe_audio(duration=8, stop_on_silence=True, silence_limit=1.8):
 
     frames = []
     silent_chunks = 0
+    last_voice_time = None
+    speech_detected = False
     start_time = time.time()
-    print("🎙️ In ascolto... (parla ora)")
+    #print("🎙️ In ascolto... (parla ora)")
 
     try:
         while True:
-            data = stream.read(CHUNK, exception_on_overflow=False)
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+            except Exception as e:
+                # Read error: riprova brevemente
+                time.sleep(0.01)
+                continue
+
             if not data:
                 break
 
-            rms = audioop.rms(data, 2)
+            frames.append(data)
+            try:
+                rms = audioop.rms(data, 2)
+            except Exception:
+                rms = 0
+
+            # debug minimale
             print(f"[MIC] RMS={rms}", end="\r")
 
-            frames.append(data)
-
-            if stop_on_silence:
-                if rms < SILENCE_THRESHOLD:
-                    silent_chunks += 1
+            # rilevazione parlato minima
+            if rms > 80:   # valore empirico: abbassalo o alzalo se necessario
+                speech_detected = True
+                last_voice_time = time.time()
+                silent_chunks = 0
+            else:
+                # se abbiamo già avuto parlato, contiamo il silenzio come hangover
+                if speech_detected:
+                    # se sono passati silence_hangover secondi dall'ultimo parlato -> stop
+                    if last_voice_time and (time.time() - last_voice_time) > silence_hangover:
+                        print("\n🔇 [MIC] Silence hangover rilevato, chiusura microfono.")
+                        break
                 else:
-                    silent_chunks = 0
+                    # se non abbiamo ancora sentito nulla e siamo oltre il limite, stop per timeout
+                    if time.time() - start_time > duration:
+                        print("\n⏱️ [MIC] Tempo massimo raggiunto, chiusura microfono.")
+                        break
 
-                # chiudi solo se 1.8 secondi di vero silenzio
-                if (silent_chunks * CHUNK / float(RATE)) > silence_limit:
-                    print("\n🔇 [MIC] Silenzio prolungato, chiusura microfono.")
-                    break
-
+            # stop globale max duration
             if time.time() - start_time > duration:
                 print("\n⏱️ [MIC] Tempo massimo raggiunto, chiusura microfono.")
                 break
-
-            time.sleep(0.002)
 
     finally:
         try:
@@ -170,33 +188,19 @@ def transcribe_audio(duration=8, stop_on_silence=True, silence_limit=1.8):
         except Exception:
             pass
         p.terminate()
-        
-    print("✅ [MIC] Microfono chiuso. Elaborazione...")
 
-    # concatena frames e converte in mono 16k per Vosk
+    #print("\n✅ [MIC] Microfono chiuso. Elaborazione...")
+
     raw = b"".join(frames)
     try:
         mono16 = _to_mono_and_resample(raw, 2, CHANNELS, RATE, out_rate=16000)
     except Exception as e:
         print(f"⚠️ [MIC] Errore conversione audio: {e}")
-        mono16 = raw  # fallback
+        mono16 = raw
 
-    # salva temporaneo (opzionale)
-    tmp = "temp_audio.wav"
-    try:
-        wf = wave.open(tmp, "wb")
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16bit
-        wf.setframerate(16000)
-        wf.writeframes(mono16)
-        wf.close()
-    except Exception as e:
-        print(f"⚠️ [MIC] Errore salvataggio WAV: {e}")
-
-    # trascrizione con Vosk (streaming)
+    # trascrizione (streaming)
     try:
         rec = KaldiRecognizer(model, 16000)
-        # feed a pezzi per essere più reattivi
         offset = 0
         step = 4000
         text = ""
@@ -206,12 +210,38 @@ def transcribe_audio(duration=8, stop_on_silence=True, silence_limit=1.8):
                 res = json.loads(rec.Result())
                 text += " " + res.get("text", "")
             offset += step
-        resf = json.loads(rec.FinalResult())
-        text += " " + resf.get("text", "")
+        text += " " + json.loads(rec.FinalResult()).get("text", "")
         text = text.strip()
     except Exception as e:
         print(f"⚠️ [STT] Errore Vosk: {e}")
         text = ""
 
-    print(f'🗣️ [STT] Hai detto: "{text}"')
+    #print(f'🗣️ [STT] Hai detto: "{text}"')
     return text
+
+def extract_name_from_text(text: str) -> str:
+    text = text.lower().strip()
+    blacklist = {"piacere", "ciao", "mi", "chiamo", "sono", "eh", "io", "il", "la", "un", "una"}
+
+    # normalizza apostrofi e punteggiatura
+    text = re.sub(r"[^a-zàèéìòù\s]", "", text)
+
+    # trova pattern "mi chiamo X" o "sono X"
+    m = re.search(r"(?:mi chiamo|sono)\s+([a-zàèéìòù]+)", text)
+    if m:
+        name = m.group(1).capitalize()
+    else:
+        # prendi la parola più probabile (non nel blacklist)
+        words = [w for w in text.split() if w not in blacklist]
+        if not words:
+            return f"Utente_{int(time.time())}"
+
+        # se ci sono più parole, scarta le ultime tipo "piacere"
+        candidates = [w for w in words if w not in ["piacere", "grazie", "ciao"]]
+        name = candidates[0].capitalize()
+
+    # evita che prenda parole generiche tipo "suo" o "bene"
+    if len(name) < 3 or name in ["bene", "grazie", "suo", "ok"]:
+        name = f"Utente_{int(time.time())}"
+
+    return name
