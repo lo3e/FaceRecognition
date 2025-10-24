@@ -13,8 +13,9 @@ import queue
 # === UTILS ===
 
 from utils.facenet_utils import compare_embeddings
-from utils.speech_utils import speak, transcribe_audio
+from utils.speech_utils import speak, transcribe_audio, extract_name_from_text
 from utils.dialog_manager import ask_ollama
+from utils.memory_manager import append_conversation, save_new_face
 from utils.async_core import (
     detect_request_q, detect_result_q,
     embed_request_q, embed_result_q,
@@ -77,53 +78,91 @@ def key_listener():
 # ==========================================
 # 🔊 INTERAZIONE (TTS + STT + LLM)
 # ==========================================
+last_interaction_time = 0
+conversation_lock = threading.Lock()
 
-def handle_interaction(name: str):
+def handle_interaction(name: str, embedding=None):
     try:
-        greeting = f"Ciao {name}!" if name != "Volto rilevato" else "Ciao, piacere di conoscerti!"
-        
-        # 🔧 FIX: Aspetta che TTS finisca COMPLETAMENTE
-        speak_async(speak, greeting).result()
-        
-        # 🔧 FIX: Pausa più lunga per evitare eco (era 0.6)
-        time.sleep(1.5)
-        
-        conversation_active = True
-        silence_counter = 0
-
-        while conversation_active and not exit_event.is_set():
-            user_text = transcribe_audio(duration=6, stop_on_silence=True).strip()
-            
-            if not user_text:
-                silence_counter += 1
-                if silence_counter > 3:
-                    print("🕓 Nessun parlato per troppo tempo, termino la conversazione.")
-                    break
-                continue
-            else:
-                silence_counter = 0
-
-            print(f"🗣️  [STT] Hai detto: \"{user_text}\"")
-
-            # elabora con Ollama
-            reply_future = ask_ollama_async(ask_ollama, user_text)
-            reply = reply_future.result(timeout=20)
-            print(f"🤖  [LLM] Risposta: \"{reply}\"")
-
-            # 🔧 FIX: Aspetta che TTS finisca
-            speak_async(speak, reply).result()
-            print(f"🔊  [TTS] Ho detto: \"{reply}\"\n")
-
-            # 🔧 FIX: Pausa più lunga dopo TTS
+        # Se il volto è sconosciuto → chiedi il nome
+        if name == "Volto rilevato" and embedding is not None:
+            speak_async(speak, "Ciao! Non credo di averti mai conosciuto prima, come ti chiami?").result()
             time.sleep(1.2)
 
-            # opzionale: uscita manuale
-            if user_text.lower() in ["esci", "stop", "basta", "arrivederci"]:
-                print("👋  Conversazione terminata su comando vocale.")
-                conversation_active = False
+            user_name = transcribe_audio(duration=12, stop_on_silence=True, silence_limit=3.5).strip()
+            name = extract_name_from_text(user_name)
+
+            speak_async(speak, f"Piacere {name}! D'ora in poi ti riconoscerò. Cosa ci fai da queste parti?").result()
+            save_new_face(name, embedding)
+            time.sleep(1.2)
+        else:
+            speak_async(speak, f"Ciao {name}!").result()
+            time.sleep(1.2)
+
+        conversation_active = True
+        silence_counter = 0
+        max_silence_rounds = 3
+        farewell_keywords = [
+            "ciao", "ci vediamo", "alla prossima", "a presto", "arrivederci",
+            "buona giornata", "buona serata", "saluto", "vado"
+        ]
+
+        print("\n🟢 Conversazione attiva — puoi parlare ora!\n")
+
+        while conversation_active and not exit_event.is_set():
+            # 🎙️ Aumentiamo il tempo per non tagliare le frasi
+            user_text = transcribe_audio(duration=20, stop_on_silence=True, silence_limit=3.5, silence_hangover=3.5).strip()
+
+            if not user_text:
+                silence_counter += 1
+                print(f"🤫 Silenzio rilevato ({silence_counter}/{max_silence_rounds})")
+                if silence_counter >= max_silence_rounds:
+                    print("🕓 Nessuna risposta per troppo tempo, termino la conversazione.")
+                    break
+                continue
+
+            silence_counter = 0
+
+            print(f"🗣️ [STT] Hai detto: \"{user_text}\"")
+
+            # 🔍 rileva saluti
+            if any(kw in user_text.lower() for kw in farewell_keywords):
+                print("👋 Rilevato saluto di chiusura.")
+                speak_async(speak, f"Ciao {name}, a presto!").result()
+                append_conversation(name, user_text, f"Ciao {name}, a presto!")
+                break
+
+            # --- Genera risposta
+            reply_future = ask_ollama_async(ask_ollama, user_text)
+            reply = reply_future.result(timeout=30)
+
+            print(f"🤖 [LLM] Risposta: \"{reply}\"")
+
+            # --- TTS
+            speak_async(speak, reply).result()
+            append_conversation(name, user_text, reply)
+            print(f"🔊 [TTS] Ho detto: \"{reply}\"\n")
+
+            # 🔄 breve pausa naturale
+            print("🔴 In attesa... (sto ascoltando di nuovo fra poco)")
+            time.sleep(1.0)
+            print("🟢 Pronto ad ascoltare!")
+
+            # 🔚 comandi manuali di chiusura
+            if user_text.lower() in ["esci", "stop", "basta"]:
+                print("👋 Conversazione terminata su comando vocale.")
+                break
+
+        print(f"✅ Conversazione con {name} terminata.\n")
 
     except Exception as e:
         print(f"[INTERACT] Errore: {e}")
+
+def handle_interaction_threadsafe(name, embedding=None):
+    global last_interaction_time
+    with conversation_lock:
+        last_interaction_time = time.time()
+        handle_interaction(name, embedding)
+        last_interaction_time = time.time()
 
 # ==========================================
 # 📦 DATABASE VOLTI
@@ -347,13 +386,16 @@ def main():
 
                 # Controlla cooldown per ri-saluto
                 if name not in seen_names or current_time - seen_names[name] > RESEEN_THRESHOLD:
-                    seen_names[name] = current_time
-                    print(f"👁️  Nuovo volto rilevato: {name}")
+                    if conversation_lock.locked():
+                        print(f"⏳ Attesa fine conversazione corrente prima di interagire con {name}.")
+                    else:
+                        seen_names[name] = current_time
+                        print(f"👁️  Nuovo volto rilevato: {name}")
 
-                    # Avvia nuova interazione in thread dedicato
-                    th = threading.Thread(target=handle_interaction, args=(name,), daemon=True)
-                    active_interactions[display_key] = th
-                    th.start()
+                        # Avvia nuova interazione in thread dedicato
+                        th = threading.Thread(target=handle_interaction_threadsafe, args=(name, embedding), daemon=True)
+                        active_interactions[display_key] = th
+                        th.start()
 
                     # Thread watcher che rimuove la entry a fine interazione
                     def _cleanup_thread(t, key):
