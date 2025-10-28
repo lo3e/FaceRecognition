@@ -14,7 +14,8 @@ import queue
 
 from utils.facenet_utils import compare_embeddings
 from utils.speech_utils import speak, transcribe_audio, extract_name_from_text
-from utils.dialog_manager import ask_ollama
+from utils.dialog_manager import ask_ollama_with_context, ask_ollama
+from utils.profile_manager import update_profile_notes
 from utils.memory_manager import append_conversation, save_new_face
 from utils.async_core import (
     detect_request_q, detect_result_q,
@@ -129,10 +130,11 @@ def handle_interaction(name: str, embedding=None):
                 print("👋 Rilevato saluto di chiusura.")
                 speak_async(speak, f"Ciao {name}, a presto!").result()
                 append_conversation(name, user_text, f"Ciao {name}, a presto!")
+                update_profile_notes(name, f"L'utente ha salutato dicendo: \"{user_text}\".")
                 break
 
             # --- Genera risposta
-            reply_future = ask_ollama_async(ask_ollama, user_text)
+            reply_future = ask_ollama_async(ask_ollama_with_context, name, user_text)
             reply = reply_future.result(timeout=30)
 
             print(f"🤖 [LLM] Risposta: \"{reply}\"")
@@ -140,6 +142,7 @@ def handle_interaction(name: str, embedding=None):
             # --- TTS
             speak_async(speak, reply).result()
             append_conversation(name, user_text, reply)
+            update_profile_notes(name, f"L'utente ha detto: \"{user_text}\". Il robot ha risposto: \"{reply}\".")
             print(f"🔊 [TTS] Ho detto: \"{reply}\"\n")
 
             # 🔄 breve pausa naturale
