@@ -9,6 +9,7 @@ import time
 import threading
 import msvcrt
 import queue
+import traceback
 
 # === UTILS ===
 
@@ -82,7 +83,7 @@ def key_listener():
 last_interaction_time = 0
 conversation_lock = threading.Lock()
 
-def handle_interaction(name: str, embedding=None):
+'''def handle_interaction(name: str, embedding=None):
     try:
         # Se il volto è sconosciuto → chiedi il nome
         if name == "Volto rilevato" and embedding is not None:
@@ -158,7 +159,190 @@ def handle_interaction(name: str, embedding=None):
         print(f"✅ Conversazione con {name} terminata.\n")
 
     except Exception as e:
-        print(f"[INTERACT] Errore: {e}")
+        print(f"[INTERACT] Errore: {e}")'''
+
+def handle_interaction(name: str, embedding=None):
+    try:
+        # === 1. Saluto iniziale / riconoscimento utente ===
+        # ramo: utente nuovo -> chiedi nome e registra
+        if name == "Volto rilevato" and embedding is not None:
+            speak_async(speak, "Ciao! Non credo di averti mai conosciuto prima, come ti chiami?").result()
+            time.sleep(1.2)
+
+            user_name = transcribe_audio(
+                duration=12,
+                stop_on_silence=True,
+                silence_limit=3.5
+            ).strip()
+
+            # Estrai nome pulito
+            name = extract_name_from_text(user_name)
+
+            speak_async(speak, f"Piacere {name}! D'ora in poi ti riconoscerò. Dimmi pure, come va oggi?").result()
+            save_new_face(name, embedding)
+            time.sleep(1.2)
+
+        else:
+            # utente già noto
+            speak_async(speak, f"Ciao {name}!").result()
+            time.sleep(1.2)
+
+        # === 2. Stato conversazionale ===
+        # GREETING: primi turni dopo il riconoscimento
+        # FREE_TALK: conversazione libera
+        # FAREWELL: chiusura
+        state = "GREETING"
+
+        if state == "GREETING":
+            print("👋 Stato iniziale: GREETING")
+
+        silence_counter = 0
+        max_silence_rounds = 3
+
+        # parole che indicano un saluto iniziale
+        greeting_keywords = [
+            "ciao",
+            "salve",
+            "buongiorno",
+            "buonasera",
+            "hey",
+            "ehi",
+            "hola"
+        ]
+        # parole che "potrebbero" significare addio,
+        # MA verranno controllate solo se siamo già in FREE_TALK
+        farewell_keywords = [
+            "ciao",
+            "ci vediamo",
+            "alla prossima",
+            "a presto",
+            "arrivederci",
+            "buona giornata",
+            "buona serata",
+            "vado",
+            "devo andare"
+        ]
+
+        print("\n🟢 Conversazione attiva — puoi parlare ora!\n")
+
+        # === 3. loop conversazionale ===
+        while not exit_event.is_set():
+            # ascolta utente
+            user_text = transcribe_audio(
+                duration=20,
+                stop_on_silence=True,
+                silence_limit=3.2
+            ).strip()
+
+            # gestione silenzio / inattività
+            if not user_text:
+                silence_counter += 1
+                print(f"🤫 Silenzio rilevato ({silence_counter}/{max_silence_rounds})")
+
+                if silence_counter >= max_silence_rounds:
+                    print("🕓 Nessuna risposta per troppo tempo, termino la conversazione.")
+                    break
+
+                # se stiamo ancora nel GREETING ma l'utente non parla, non passiamo a FREE_TALK
+                # semplicemente continuiamo ad ascoltare
+                continue
+
+            # abbiamo parlato -> reset contatore silenzio
+            silence_counter = 0
+            print(f"🗣️ [STT] Hai detto: \"{user_text}\"")
+
+            lower_text = user_text.lower()
+
+            # === 3a. Gestione dello stato GREETING ===
+            if state == "GREETING":
+                # logica: nel GREETING non interpretiamo "ciao" come addio.
+                # appena l'utente dice QUALCOSA di più del solo "ciao", passiamo a FREE_TALK
+                # esempi validi per passare a FREE_TALK:
+                # - "ciao come stai"
+                # - "tutto bene?"
+                # - "sto facendo un esperimento"
+                if len(lower_text.split()) > 1 or "come" in lower_text or "sto" in lower_text:
+                    state = "FREE_TALK"
+                else:
+                    # se ha detto solo "ciao", rispondi breve e resta in GREETING
+                    reply_future = ask_ollama_async(
+                        lambda prompt: ask_ollama_with_context(name, prompt),
+                        user_text
+                        )
+                    reply = reply_future.result(timeout=30)
+
+                    speak_async(speak, reply).result()
+                    append_conversation(name, user_text, reply)
+                    update_profile_notes(name, f"L'utente ha detto: \"{user_text}\". Il robot ha risposto: \"{reply}\".")
+
+                    # riprendi ascolto
+                    print("🟢 Pronto ad ascoltare!")
+                    time.sleep(1.0)
+                    continue  # torna a inizio while senza valutare free talk / chiusura
+
+
+            # === 3b. Gestione saluto di chiusura (solo se già in FREE_TALK)
+            # condizione: user_text è corto e contiene parole di congedo
+            is_goodbye = (
+                state == "FREE_TALK"
+                and any(kw in lower_text for kw in farewell_keywords)
+                and not any(kw in lower_text for kw in greeting_keywords)
+            )
+
+            # --- Rilevato saluto finale
+            if is_goodbye:
+                print("👋 Rilevato saluto di chiusura.")
+
+                farewell_prompt = (
+                    f"L'utente {name} ha detto: '{user_text}'. "
+                    f"Genera un saluto di chiusura naturale, coerente e contestuale "
+                    f"che mostri empatia e si congedi in modo amichevole, "
+                    f"senza ripetere 'Ciao' più di una volta."
+                )
+
+                reply_future = ask_ollama_async(
+                    lambda prompt: ask_ollama_with_context(name, prompt),
+                    farewell_prompt
+                )
+                farewell_reply = reply_future.result(timeout=20)
+
+                speak_async(speak, farewell_reply).result()
+                append_conversation(name, user_text, farewell_reply)
+                print(f"🔊 [TTS] Ho detto: \"{farewell_reply}\"")
+                break
+
+            # === 3c. Conversazione normale (FREE_TALK)
+            # chiediamo all'LLM una risposta contestuale (profilo + memoria breve)
+            reply_future = ask_ollama_async(
+                lambda prompt: ask_ollama_with_context(name, prompt),
+                user_text
+                )
+            reply = reply_future.result(timeout=30)
+
+            print(f"🤖 [LLM] Risposta: \"{reply}\"")
+
+            speak_async(speak, reply).result()
+
+            append_conversation(name, user_text, reply)
+            update_profile_notes(
+                name,
+                f"L'utente ha detto: \"{user_text}\". Il robot ha risposto: \"{reply}\"."
+            )
+
+            print(f"🔊 [TTS] Ho detto: \"{reply}\"\n")
+
+            # piccola pausa naturale e loop continua
+            time.sleep(1.0)
+            print("🟢 Pronto ad ascoltare!")
+
+        # === 4. Uscita pulita dalla conversazione ===
+        print(f"✅ Conversazione con {name} terminata.\n")
+
+        # (qui in Step 3 metteremo anche l'aggiornamento del profilo a fine chat)
+
+    except Exception as e:
+        print("[INTERACT] Errore:", repr(e))
+        traceback.print_exc()
 
 def handle_interaction_threadsafe(name, embedding=None):
     global last_interaction_time
