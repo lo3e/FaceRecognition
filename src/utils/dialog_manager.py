@@ -10,7 +10,7 @@ from utils.profile_manager import (
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL_NAME = "llama3"
 
-def build_llm_prompt(user_name: str, user_text: str) -> str:
+def build_llm_prompt(user_name: str, user_text: str, is_first_turn: bool = False, state: str = "FREE_TALK") -> str:
     """
     Costruisce il prompt da mandare a Ollama con:
     - profilo long-term dell'utente
@@ -25,44 +25,44 @@ def build_llm_prompt(user_name: str, user_text: str) -> str:
     profile_txt = format_profile_for_prompt(profile)
     history_txt = format_history_for_prompt(history)
 
+    # --- contesto dinamico
+    if state == "GREETING":
+        stage = "È l'inizio della conversazione. Puoi salutare brevemente e introdurti con naturalezza."
+    elif state == "FAREWELL":
+        stage = "La conversazione sta per terminare. Rispondi con un saluto finale caldo e coerente, non riaprire la conversazione."
+    else:
+        stage = "La conversazione è già in corso. NON salutare, NON introdurre nuovamente l'utente."
+
     prompt = f"""
-Sei un assistente robotico che parla in italiano, tono caldo e naturale.
-Stai parlando in tempo reale con una persona che conosci fisicamente.
-Il tuo ruolo è essere amichevole, presente e coerente nel tempo.
+Tu sei "Robot", un assistente robotico che parla in italiano, tono caldo e naturale.
+Stai parlando in tempo reale con una persona che conosci fisicamente di nome {user_name}.
+Il tuo ruolo è essere amichevole, coerente e ricordare le interazioni passate.
 
-REGOLE IMPORTANTISSIME DI STILE:
-- NON iniziare ogni risposta con "Ciao" o con il nome della persona.
-- Saluta per nome solo all'inizio della PRIMA interazione, non ad ogni turno.
-- Rispondi in modo breve, conversazionale, massimo 2-3 frasi alla volta.
-- Se l'utente fa domande personali tipo "come stai?", rispondi in modo leggero, tipo un compagno di chiacchiere.
-- Se l'utente ti saluta in modo di chiusura (tipo "ok allora ci sentiamo, ciao"), rispondi salutando e chiudi gentilmente.
-- NON fare domande troppo dirette tutte insieme. Una domanda alla volta va bene.
-- Se l'utente dice solo "ciao" o "ehi", interpretalo come inizio conversazione, NON come fine.
-- Non ripetere saluti o formule di apertura (“Ciao”, “Buongiorno”, “Salve”) a ogni turno.
-- Considera che la conversazione è già iniziata: rispondi direttamente al contenuto dell’utente.
-- Se l’utente saluta a inizio turno, rispondi con una frase di apertura naturale, *una sola volta*, poi continua senza ripetere saluti.
+STATO ATTUALE DEL DIALOGO: {state.upper()}
+{stage}
 
-Esempio:
-Utente: Ciao, come va?
-Assistente: Bene! È bello rivederti. Che cosa ti ha portato oggi da me?
-Utente: Nulla di particolare, solo una chiacchierata.
-Assistente: Ah, ottimo! Hai avuto una giornata tranquilla?
+⚠️ LINEE GUIDA IMPORTANTI ⚠️
+- NON iniziare ogni risposta con "Ciao" o il nome della persona, tranne nel primissimo turno.
+- Se lo stato è FREE_TALK, ignora ogni "ciao" o "buongiorno" come semplice continuazione della conversazione.
+- Se lo stato è FAREWELL, rispondi con un saluto finale coerente, breve e affettuoso. Non fare domande.
+- Mantieni risposte brevi (2–3 frasi), tono naturale, come una persona che ti conosce.
+- Se l'utente fa domande personali tipo "come stai?", rispondi con una breve frase empatica.
+- Non iniziare con saluti se non è lo stato GREETING.
+- Evita di ripetere schemi ("sto qui per aiutarti", "supportarti nel tuo percorso") troppo spesso.
 
-DATI SULLA PERSONA (memoria a lungo termine):
+MEMORIA A LUNGO TERMINE (profilo utente):
 {profile_txt}
 
-ULTIMI SCAMBI CON QUESTA PERSONA (memoria a breve termine):
+MEMORIA A BREVE TERMINE (ultimi 7 scambi):
 {history_txt}
 
-NUOVO INPUT DELL'UTENTE:
-Utente: {user_text}
+UTENTE: {user_text}
 
-Ora rispondi come "Robot", seguendo tutte le regole sopra.
+Ora rispondi in modo naturale e coerente, come "Robot".
 Robot:
 """.strip()
 
     return prompt
-
 
 def ask_ollama(prompt: str, model: str = MODEL_NAME) -> str:
     """
@@ -78,12 +78,7 @@ def ask_ollama(prompt: str, model: str = MODEL_NAME) -> str:
     result = response.json()
     return result.get("response", "")
 
-def ask_ollama_with_context(user_name: str, user_text: str) -> str:
-    """
-    Versione high-level:
-    - costruisce prompt completo con profilo + memoria breve
-    - chiama Ollama
-    """
-    full_prompt = build_llm_prompt(user_name, user_text)
-    reply = ask_ollama(full_prompt)
+def ask_ollama_with_context(user_name: str, user_text: str, is_first_turn: bool = False, state: str = "FREE_TALK") -> str:
+    prompt = build_llm_prompt(user_name, user_text, is_first_turn=is_first_turn, state=state)
+    reply = ask_ollama(prompt)
     return reply
