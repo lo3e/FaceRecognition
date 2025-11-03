@@ -1,13 +1,41 @@
-# 🤖 FaceRecognition Assistant — Real-Time Vision & Voice AI
+<p align="center">
+  <img src="https://img.shields.io/badge/SMILE-%F0%9F%A7%A0_Social_Memory_Integrated_Learning_Environment-blue?style=for-the-badge" alt="SMILE Logo">
+</p>
 
-**FaceRecognition Assistant** is a multimodal AI system that combines:
-- 🎥 **Real-time face detection and recognition**
-- 🗣️ **Speech-to-text (STT)** with [Vosk](https://alphacephei.com/vosk/)
-- 💬 **Conversational intelligence** powered by [Ollama](https://ollama.ai/)
-- 🔊 **Text-to-speech (TTS)** responses via `pyttsx3`
-- 🧠 **Persistent memory** for user identity and conversation history
+<p align="center">
+  <b>SMILE</b> — <i>Social Memory Integrated Learning Environment</i><br>
+  <sub>AI-driven conversational system integrating face recognition, dialogue memory, and personalized user profiling.</sub>
+</p>
 
-It can recognize you, remember previous interactions, and carry on contextual conversations — completely offline (for STT/TTS) and locally integrated with Ollama for reasoning.
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11-blue?logo=python&style=flat-square">
+  <img src="https://img.shields.io/badge/Ollama-LLM-green?style=flat-square">
+  <img src="https://img.shields.io/badge/DeepFace-Face_Recognition-orange?style=flat-square">
+  <img src="https://img.shields.io/badge/Vosk-STT-yellow?style=flat-square">
+  <img src="https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square">
+</p>
+
+---
+
+# 🧠 SMILE — *Social Memory Integrated Learning Environment*
+
+**Version:** 1.0  
+**Author:** Lorenzo (AI Robotics Lab)  
+**Language:** Python 3.11  
+**License:** MIT  
+
+---
+
+## 📘 Overview
+
+**SMILE** (*Social Memory Integrated Learning Environment*) is an intelligent conversational agent that integrates:
+- **real-time face recognition**,  
+- **context-aware dialogue**,  
+- and **long-term personalized memory**.
+
+The system recognizes users visually, maintains short-term conversation history, and automatically summarizes and updates each user's **long-term profile** through interaction.
+
+It is built for **embodied AI** and **social robotics** contexts, where continuity and personalization in human-robot dialogue are key.
 
 ---
 
@@ -43,27 +71,43 @@ It can recognize you, remember previous interactions, and carry on contextual co
 ```
 FaceRecognition/
 │
-├── src/
-│ ├── recognize_live.py # Main runtime script
-│ ├── utils/
-│ │ ├── speech_utils.py # Speech recognition + TTS
-│ │ ├── facenet_utils.py # Embedding & comparison logic
-│ │ ├── dialog_manager.py # Ollama integration
-│ │ ├── async_core.py # Thread pools, async queues
-│ │ └── ... # Other helpers
-│ └── data/
-│ ├── embeddings.pkl # Stored face embeddings
-│ └── conversations/ # JSON logs per user
+├── data/ # Persistent user data
+│ ├── known_faces/ # Registered user images
+│ ├── conversations/ # Conversation transcripts
+│ ├── profiles/ # User profiles (JSON)
+│ └── embeddings.pkl # Face embeddings database
 │
-├── models/
-│ └── vosk-model-small-it-0.22/ # (Optional local copy)
+├── src/ # Source code
+│ ├── config.py # Local configuration (ignored by Git)
+│ ├── recognize_live.py # Main live recognition and dialogue loop
+│ ├── utils/ # Functional modules
+│ │ ├── dialog_manager.py
+│ │ ├── memory_manager.py
+│ │ ├── profile_manager.py
+│ │ ├── speech_utils.py
+│ │ └── facenet_utils.py
+│ └── init.py
 │
+├── requirements.txt
 └── README.md
 ```
 
 ---
 
-## ⚙️ Installation
+## 🧩 Core Modules
+
+| Module | Description |
+|---------|-------------|
+| **recognize_live.py** | Main entry point. Handles video stream, voice input, and conversation logic. |
+| **dialog_manager.py** | Builds prompts and manages dialogue state (GREETING, FREE_TALK, FAREWELL). |
+| **memory_manager.py** | Maintains working and long-term memory, generates summaries via LLM. |
+| **profile_manager.py** | Handles user profiles (creation, update, persistence). |
+| **speech_utils.py** | Controls TTS and STT pipelines. |
+| **facenet_utils.py** | Provides facial embedding and recognition functionality. |
+
+---
+
+## 🚀 Getting Started
 
 ### 1️⃣ Clone the Repository
 ```bash
@@ -80,9 +124,10 @@ facenet\Scripts\activate   # Windows
 source facenet/bin/activate  # macOS/Linux
 ```
 
-### 3️⃣ Install Dependencies
+### 3️⃣ Configure system and Install Dependencies
 
 ```
+cp src/config_example.py src/config.py
 pip install -r requirements.txt
 ```
 
@@ -104,8 +149,7 @@ EXTERNAL_MODEL_DIR = r"C:\Users\<you>\Documents\AI\models\vosk-model-it-0.22"
 ## 🚀 How to Run
 
 ```
-cd src
-python recognize_live.py
+python -m src.recognize_live
 ```
 
 Once running:
@@ -154,7 +198,13 @@ Each recognized user has:
 - A **name**
 - A **conversation history JSON file**
 
-When the same person is detected again, the assistant automatically loads their identity and past interactions, resuming the context seamlessly.
+When the same person is detected again, the assistant automatically loads their identity and past interactions, resuming the context seamlessly. SMILE uses a hybrid memory system:
+
+- **Short-term memory**: the last 7 conversational exchanges
+
+- **Long-term memory**: summarized user profile stored in `data/profiles/`
+
+Each session enriches the user profile with new insights extracted from conversation using an LLM-based summarization pipeline.
 
 ---
 
@@ -179,22 +229,30 @@ When the same person is detected again, the assistant automatically loads their 
 
 ---
 
+## 🏗️ Future Improvements
+
+| Milestone	| Status| Description |
+|-----------|-------|-------------|
+| v1.0 — SMILE Core	| ✅ Done | Real-time recognition, memory, summarization |
+| v1.1 — Questionnaire Init	| 🔜 Planned | Profile initialization for new users |
+| v1.2 — Emotional Context | ⏳ In design | Affective state tracking & adaptive responses |
+| v2.0 — Multi-agent Setup | ⚙️ Future	| Multi-person recognition and shared context |
+
+---
+
+## ⚠️ Disclaimer
+
+This system is intended for research and development in social robotics and conversational AI.
+All personal data is stored locally and should be handled according to GDPR and privacy best practices.
+
+---
+
 ## 🧑‍💻 Author
 
 **Lorenzo D'Errico**  
 PhD student in AI @ Federico II  
 Email: [lorenzo.derrico@unina.it]  
 LinkedIn: [linkedin/lo_de06]
-
----
-
-## 🏗️ Future Improvements
-
-- Improve TTS voice with neural synthesis  
-- Add long-term, context-aware memory per user  
-- Support emotional and gesture recognition  
-- Handle multi-user group conversations  
-- Optimize performance and UX flow
 
 ---
 
