@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from datetime import datetime
 
 # cartelle persistenti
 BASE_DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../data"))
@@ -72,12 +73,16 @@ def load_profile(name: str) -> dict:
         # profilo vuoto iniziale
         return {
             "name": name,
-            "known_since": time.strftime("%Y-%m-%d"),
+            "known_since": datetime.now().strftime("%Y-%m-%d"),
+            "age": None,
+            "gender": None,
+            "occupation": None,
             "interests": [],
-            "profession": None,
-            "tone": None,
             "personality": None,
-            "notes": ""
+            "goals": [],
+            "notes_summary": "",
+            "recent_conversations": [],
+            "last_update": None
         }
 
     try:
@@ -87,12 +92,16 @@ def load_profile(name: str) -> dict:
         # se c'è un problema di parsing, fallback a base
         return {
             "name": name,
-            "known_since": time.strftime("%Y-%m-%d"),
+            "known_since": datetime.now().strftime("%Y-%m-%d"),
+            "age": None,
+            "gender": None,
+            "occupation": None,
             "interests": [],
-            "profession": None,
-            "tone": None,
             "personality": None,
-            "notes": ""
+            "goals": [],
+            "notes_summary": "",
+            "recent_conversations": [],
+            "last_update": None
         }
 
 def save_profile(name: str, profile: dict):

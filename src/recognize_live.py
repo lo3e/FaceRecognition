@@ -15,10 +15,10 @@ import traceback
 
 from utils.facenet_utils import compare_embeddings
 from utils.speech_utils import speak, transcribe_audio, extract_name_from_text
-from utils.dialog_manager import ask_ollama_with_context
+from utils.dialog_manager import ask_ollama_with_context, summarize_conversation
 from utils.text_post import clean_llm_reply
-from utils.profile_manager import update_profile_notes
-from utils.memory_manager import append_conversation, save_new_face
+from utils.profile_manager import load_recent_history
+from utils.memory_manager import log_full_conversation, save_new_face
 from utils.async_core import (
     detect_request_q, detect_result_q,
     embed_request_q, embed_result_q,
@@ -177,11 +177,17 @@ def handle_interaction(name: str, embedding=None):
 
             # === 3a. Gestione stato GREETING ===
             if state == "GREETING":
-                # se l'utente dice più di un semplice "ciao" → passiamo a FREE_TALK
-                if len(lower_text.split()) > 1 or "come" in lower_text or "sto" in lower_text:
+                # appena l'utente dice qualcosa di più del semplice saluto, passiamo a FREE_TALK
+                if (
+                    len(lower_text.split()) > 1
+                    or "come" in lower_text
+                    or "sto" in lower_text
+                    or "bene" in lower_text
+                    or "male" in lower_text
+                ):
                     state = "FREE_TALK"
                 else:
-                    # È ancora un saluto leggero, restiamo in GREETING
+                    # È ancora un saluto leggero, rispondi e continua
                     reply_future = ask_ollama_async(
                         lambda prompt: ask_ollama_with_context(
                             name,
@@ -194,26 +200,41 @@ def handle_interaction(name: str, embedding=None):
 
                     reply_raw = reply_future.result(timeout=30)
                     reply = clean_llm_reply(reply_raw, state=state, is_first_turn=first_turn)
-
-                    # dopo la prima risposta dell'assistente, non è più "primo turno"
                     first_turn = False
 
                     speak_async(speak, reply).result()
-                    append_conversation(name, user_text, reply)
-                    update_profile_notes(name, f"L'utente ha detto: \"{user_text}\". Il robot ha risposto: \"{reply}\".")
-
+                    log_full_conversation(name, user_text, reply)
                     print("🟢 Pronto ad ascoltare!")
                     time.sleep(1.0)
-                    continue  # torna all'ascolto senza passare sotto
+                    continue
 
-            # === 3b. Fine conversazione? (solo se già in FREE_TALK)
+            # === 3b. Fine conversazione? (sia FREE_TALK che GREETING)
+            goodbye_phrases = [
+                "devo andare",
+                "vado via",
+                "adesso vado",
+                "adesso ti saluto",
+                "ci sentiamo dopo",
+                "alla prossima",
+                "a dopo",
+                "a dopo ciao",
+                "va bene ciao",
+                "ciao ciao",
+            ]
+
             is_goodbye = (
-                state == "FREE_TALK"
-                and any(kw in lower_text for kw in farewell_keywords)
-                and not any(kw in lower_text for kw in greeting_keywords)
+                any(kw in lower_text for kw in goodbye_phrases)
+                or any(kw in lower_text for kw in ["arrivederci", "ci vediamo", "a presto"])
             )
 
-            if is_goodbye:
+            # escludi solo i "ciao" di saluto iniziale
+            is_pure_greeting = (
+                len(lower_text.split()) <= 2
+                and any(kw in lower_text for kw in greeting_keywords)
+                and not any(kw in lower_text for kw in goodbye_phrases)
+            )
+
+            if is_goodbye and not is_pure_greeting:
                 print("👋 Rilevato saluto di chiusura.")
 
                 farewell_prompt = (
@@ -239,13 +260,15 @@ def handle_interaction(name: str, embedding=None):
                 )
 
                 speak_async(speak, farewell_reply).result()
-                append_conversation(name, user_text, farewell_reply)
+                log_full_conversation(name, user_text, farewell_reply)
                 print(f"🔊 [TTS] Ho detto: \"{farewell_reply}\"")
 
-                # ⛔ dopo che l'utente ha detto "vado", NON torniamo ad ascoltare
-                break
+                break  # ⛔ esci dal ciclo dopo il saluto
+
 
             # === 3c. Conversazione normale (FREE_TALK)
+            state = "FREE_TALK"
+
             reply_future = ask_ollama_async(
                 lambda prompt: ask_ollama_with_context(
                     name,
@@ -267,11 +290,11 @@ def handle_interaction(name: str, embedding=None):
             first_turn = False
 
             speak_async(speak, reply).result()
-            append_conversation(name, user_text, reply)
-            update_profile_notes(
-                name,
-                f"L'utente ha detto: \"{user_text}\". Il robot ha risposto: \"{reply}\"."
-            )
+            log_full_conversation(name, user_text, reply)
+            #update_profile_notes(
+            #    name,
+            #    f"L'utente ha detto: \"{user_text}\". Il robot ha risposto: \"{reply}\"."
+            #)
 
             print(f"🔊 [TTS] Ho detto: \"{reply}\"\n")
 
@@ -281,7 +304,16 @@ def handle_interaction(name: str, embedding=None):
         # === 4. Fine conversazione ===
         print(f"✅ Conversazione con {name} terminata.\n")
 
-        # (step futuro: aggiornamento profilo sintetico)
+        try:
+            # 1) prendo gli ultimi turni dal JSON delle conversazioni
+            recent = load_recent_history(name, window=10)  # qui ci sono "user" e "bot"
+
+            # 2) chiedo a Ollama di riassumerli e di scriverli nel profilo
+            summarize_conversation(name, recent)
+
+            print(f"🧠 Profilo di {name} aggiornato con il riassunto della conversazione.")
+        except Exception as e:
+            print(f"[MEMORY] Errore durante aggiornamento del profilo: {e}")
 
     except Exception as e:
         print("[INTERACT] Errore:", repr(e))
