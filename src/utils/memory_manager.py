@@ -4,24 +4,27 @@ import pickle
 import time
 import datetime
 
+from src.config import CONVERSATIONS_DIR, PROFILES_DIR, EMBEDDINGS_FILE
+
+'''
 EMB_FILE = "../data/embeddings.pkl"
 CONV_DIR = "../data/conversations"
 PROFILE_DIR = "../data/profiles"
 
 os.makedirs(CONV_DIR, exist_ok=True)
-
+'''
 # ====== GESTIONE VOLTI ======
 
 def save_new_face(name, embedding):
     """Salva un nuovo volto nel database embeddings.pkl."""
-    if os.path.exists(EMB_FILE):
-        with open(EMB_FILE, "rb") as f:
+    if os.path.exists(EMBEDDINGS_FILE):
+        with open(EMBEDDINGS_FILE, "rb") as f:
             known = pickle.load(f)
     else:
         known = {}
 
     known[name] = embedding
-    with open(EMB_FILE, "wb") as f:
+    with open(EMBEDDINGS_FILE, "wb") as f:
         pickle.dump(known, f)
     print(f"💾 Nuovo volto salvato come '{name}' in embeddings.pkl")
 
@@ -30,7 +33,7 @@ def save_new_face(name, embedding):
 
 def log_full_conversation(name, user_text, bot_reply):
     """Salva ogni scambio in un file JSON per utente."""
-    path = os.path.join(CONV_DIR, f"{name}.json")
+    path = os.path.join(CONVERSATIONS_DIR, f"{name}.json")
     record = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "user": user_text,
@@ -49,7 +52,7 @@ def log_full_conversation(name, user_text, bot_reply):
 
 def load_profile(name: str) -> dict:
     """Carica o crea un profilo per l'utente."""
-    path = os.path.join(PROFILE_DIR, f"{name}.json")
+    path = os.path.join(PROFILES_DIR, f"{name}.json")
     if not os.path.exists(path):
         # nuovo profilo base
         profile = {
@@ -79,8 +82,7 @@ def load_profile(name: str) -> dict:
 
 def save_profile(name: str, profile: dict):
     """Salva il profilo aggiornato."""
-    os.makedirs(PROFILE_DIR, exist_ok=True)
-    path = os.path.join(PROFILE_DIR, f"{name}.json")
+    path = os.path.join(PROFILES_DIR, f"{name}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(profile, f, indent=2, ensure_ascii=False)
 

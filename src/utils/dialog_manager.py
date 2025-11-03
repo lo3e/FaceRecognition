@@ -1,14 +1,11 @@
 # utils/dialog_manager.py
-
 import requests
 import json
-import traceback
 from datetime import datetime
-import re
 
 # 🔴 IMPORT GIUSTI
 # prendi il profilo e la history SOLO da profile_manager
-from utils.profile_manager import (
+from src.utils.profile_manager import (
     load_profile, save_profile,
     load_recent_history,
     format_profile_for_prompt,

@@ -2,7 +2,9 @@ import os
 import json
 import time
 from datetime import datetime
+from src.config import CONVERSATIONS_DIR, PROFILES_DIR
 
+'''
 # cartelle persistenti
 BASE_DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../data"))
 CONV_DIR = os.path.join(BASE_DATA_DIR, "conversations")
@@ -10,14 +12,15 @@ PROFILE_DIR = os.path.join(BASE_DATA_DIR, "profiles")
 
 os.makedirs(CONV_DIR, exist_ok=True)
 os.makedirs(PROFILE_DIR, exist_ok=True)
+'''
 
 def _conv_path(name: str) -> str:
     safe = name.replace(" ", "_")
-    return os.path.join(CONV_DIR, f"{safe}.json")
+    return os.path.join(CONVERSATIONS_DIR, f"{safe}.json")
 
 def _profile_path(name: str) -> str:
     safe = name.replace(" ", "_")
-    return os.path.join(PROFILE_DIR, f"{safe}.json")
+    return os.path.join(PROFILES_DIR, f"{safe}.json")
 
 # -------------------------
 # 1. Conversazione (short-term memory)

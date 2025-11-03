@@ -13,13 +13,14 @@ import traceback
 
 # === UTILS ===
 
-from utils.facenet_utils import compare_embeddings
-from utils.speech_utils import speak, transcribe_audio, extract_name_from_text
-from utils.dialog_manager import ask_ollama_with_context, summarize_conversation
-from utils.text_post import clean_llm_reply
-from utils.profile_manager import load_recent_history
-from utils.memory_manager import log_full_conversation, save_new_face
-from utils.async_core import (
+from src.config import EMBEDDINGS_FILE
+from src.utils.facenet_utils import compare_embeddings
+from src.utils.speech_utils import speak, transcribe_audio, extract_name_from_text
+from src.utils.dialog_manager import ask_ollama_with_context, summarize_conversation
+from src.utils.text_post import clean_llm_reply
+from src.utils.profile_manager import load_recent_history
+from src.utils.memory_manager import log_full_conversation, save_new_face
+from src.utils.async_core import (
     detect_request_q, detect_result_q,
     embed_request_q, embed_result_q,
     start_workers, exit_event,
@@ -32,7 +33,7 @@ from utils.async_core import (
 # ⚙️ CONFIGURAZIONE
 # ==========================================
 
-EMB_FILE = "../data/embeddings.pkl"
+# EMB_FILE = "../data/embeddings.pkl"
 
 # 🔧 Configurazione ottimizzata
 TRACKER_MAX_LOST = 15  # 🔧 Aumentato da 8 (più tollerante)
@@ -333,8 +334,8 @@ def handle_interaction_threadsafe(name, embedding=None):
 
 def load_known_faces():
     """Carica il database di embedding noti."""
-    if os.path.exists(EMB_FILE):
-        with open(EMB_FILE, "rb") as f:
+    if os.path.exists(EMBEDDINGS_FILE):
+        with open(EMBEDDINGS_FILE, "rb") as f:
             known = pickle.load(f)
         print(f"✅ Caricati {len(known)} volti noti.")
         return known

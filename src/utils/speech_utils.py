@@ -1,27 +1,28 @@
 import pyaudio
 import audioop
-import wave
 import time
 import json
-import os
 import re
 from vosk import Model, KaldiRecognizer
 import pyttsx3
 
+from src.config import VOSK_MODEL_PATH, VOICE_RATE, VOICE_VOLUME, DEFAULT_VOICE_INDEX
+model = Model(str(VOSK_MODEL_PATH))
+
 # ================== CONFIGURAZIONE MODELLO VOSK ==================
-EXTERNAL_MODEL_DIR = r"C:\Users\brain\Documents\Universita\Erasmus\Proggetto\Dati\vosk-model-it-0.22"
+# EXTERNAL_MODEL_DIR = r"C:\Users\brain\Documents\Universita\Erasmus\Proggetto\Dati\vosk-model-it-0.22"
 
 def speak(text):
-    engine = pyttsx3.init() 
-    engine.setProperty('rate', 180) # velocità voce 
-    engine.setProperty('volume', 0.9) # volume 
-    voices = engine.getProperty('voices') 
-    engine.setProperty('voice', voices[0].id) # 0=maschio, 1=femmina (di solito)
-    engine.say(text) 
+    engine = pyttsx3.init()
+    engine.setProperty('rate', VOICE_RATE)
+    engine.setProperty('volume', VOICE_VOLUME)
+    voices = engine.getProperty('voices')
+    engine.setProperty('voice', voices[DEFAULT_VOICE_INDEX].id)
+    engine.say(text)
     engine.runAndWait()
 
 # MODEL_PATH deve già essere definito come fai ora
-model = Model(EXTERNAL_MODEL_DIR)
+# model = Model(EXTERNAL_MODEL_DIR)
 # ==========================================================
 
 def find_working_mic(trials_rates=(16000, 48000), trials_channels=(1, 2), timeout=1.0):
